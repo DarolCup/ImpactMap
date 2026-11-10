@@ -16,24 +16,29 @@ class AnalysisError(Exception):
     pass
 
 
-def git(repo: Path, *args: str) -> bytes:
-    env = {**os.environ, "GIT_NO_LAZY_FETCH": "1", "GIT_OPTIONAL_LOCKS": "0"}
+def git(repo: Path, *args: str, env: dict[str, str] | None = None, timeout: int = 30) -> bytes:
+    env = {**(os.environ if env is None else env), "GIT_NO_LAZY_FETCH": "1", "GIT_OPTIONAL_LOCKS": "0"}
     try:
         result = subprocess.run(
             ["git", "-c", "core.fsmonitor=false", "-C", str(repo), *args],
             capture_output=True,
             env=env,
-            timeout=30,
+            timeout=timeout,
             creationflags=PROCESS_FLAGS,
         )
     except FileNotFoundError as exc:
         raise AnalysisError("Git не найден в PATH.") from exc
     except subprocess.TimeoutExpired as exc:
-        raise AnalysisError("Git не ответил за 30 секунд.") from exc
+        raise AnalysisError(f"Git не ответил за {timeout} секунд.") from exc
     if result.returncode:
         message = os.fsdecode(result.stderr).strip()
         raise AnalysisError(f"Ошибка Git: {message or result.returncode}")
     return result.stdout
+
+
+def git_paths(output: bytes) -> list[str]:
+    # Git writes repository-relative paths with forward slashes, even on Windows.
+    return sorted({os.fsdecode(path) for path in output.split(b"\0") if path})
 
 
 def repository_changes(folder: Path) -> tuple[Path, list[str]]:
@@ -43,9 +48,7 @@ def repository_changes(folder: Path) -> tuple[Path, list[str]]:
     root = Path(os.fsdecode(root_output))
     tracked = git(root, "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "HEAD", "--")
     untracked = git(root, "ls-files", "--others", "--exclude-standard", "-z")
-    # Git writes repository-relative paths with forward slashes, even on Windows.
-    paths = sorted({os.fsdecode(path) for path in (tracked + untracked).split(b"\0") if path})
-    return root, paths
+    return root, git_paths(tracked + untracked)
 
 
 def find_analyzer(setting: str | None) -> Path | None:

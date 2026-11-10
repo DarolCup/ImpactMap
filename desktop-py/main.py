@@ -2,9 +2,10 @@ import argparse
 import os
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import QStandardPaths, Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -22,21 +23,27 @@ from PySide6.QtWidgets import (
 )
 
 from analysis import AnalysisError, analyze, repository_changes
+from github_repo import BRANCH, REPOSITORY, GitHubResult, analyze_github
 from graph import DependencyGraph, display_path
 
 
 class AnalysisThread(QThread):
     changes_found = Signal(object)
     result_ready = Signal(object, bool)
+    github_ready = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, folder: Path, analyzer: str | None, parent: QWidget):
+    def __init__(self, folder: Path | None, cache: Path, analyzer: str | None, parent: QWidget):
         super().__init__(parent)
         self.folder = folder
+        self.cache = cache
         self.analyzer = analyzer
 
     def run(self):
         try:
+            if self.folder is None:
+                self.github_ready.emit(analyze_github(self.cache, self.analyzer))
+                return
             repo, changes = repository_changes(self.folder)
             self.changes_found.emit(changes)
             result, example = analyze(repo, changes, self.analyzer)
@@ -50,8 +57,21 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.analyzer = analyzer
         self.worker = None
+        self.github_result: GitHubResult | None = None
+        self.github_error: str | None = None
+        self.cache = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.CacheLocation))
         self.setWindowTitle("ImpactMap")
         self.resize(1050, 650)
+
+        self.mode = QComboBox()
+        self.mode.addItems(["GitHub", "Локальная папка"])
+        self.mode.setAccessibleName("Источник репозитория")
+        self.mode.currentIndexChanged.connect(self.show_mode)
+        self.github_source = QLabel()
+        self.github_source.setTextFormat(Qt.TextFormat.PlainText)
+        self.github_source.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.refresh = QPushButton("Обновить с GitHub")
+        self.refresh.clicked.connect(self.refresh_github)
 
         self.folder = QLineEdit()
         self.folder.setPlaceholderText("Путь к локальному Git-репозиторию")
@@ -62,13 +82,16 @@ class MainWindow(QMainWindow):
         self.check = QPushButton("Проверить изменения")
         self.check.clicked.connect(self.check_changes)
         toolbar = QHBoxLayout()
+        toolbar.addWidget(self.mode)
+        toolbar.addWidget(self.github_source, 1)
+        toolbar.addWidget(self.refresh)
         toolbar.addWidget(self.folder, 1)
         toolbar.addWidget(self.choose)
         toolbar.addWidget(self.check)
 
         self.changed = QListWidget()
-        self.changed.setAccessibleName("Изменённые файлы относительно HEAD")
-        self.changed_title = QLabel("Изменённые файлы относительно HEAD")
+        self.changed.setAccessibleName("Изменённые файлы")
+        self.changed_title = QLabel()
         changed_panel = QWidget()
         changed_layout = QVBoxLayout(changed_panel)
         changed_layout.addWidget(self.changed_title)
@@ -99,7 +122,7 @@ class MainWindow(QMainWindow):
         content.addWidget(changed_panel)
         content.addWidget(self.tabs)
         content.setSizes([280, 770])
-        self.status = QLabel("Выберите папку репозитория, чтобы начать.")
+        self.status = QLabel()
         self.status.setTextFormat(Qt.TextFormat.PlainText)
         self.status.setWordWrap(True)
         page = QWidget()
@@ -108,6 +131,24 @@ class MainWindow(QMainWindow):
         layout.addWidget(content, 1)
         layout.addWidget(self.status)
         self.setCentralWidget(page)
+        self.show_mode()
+
+    def show_mode(self):
+        github = self.mode.currentIndex() == 0
+        for control in (self.github_source, self.refresh):
+            control.setVisible(github)
+        for control in (self.folder, self.choose, self.check):
+            control.setVisible(not github)
+        self.clear_result()
+        if github:
+            self.github_source.setText(f"{REPOSITORY} / {BRANCH}")
+            self.status.setText("Нажмите «Обновить с GitHub», чтобы проверить изменения.")
+            if self.github_result is not None:
+                self.show_github_result(self.github_result)
+            if self.github_error is not None:
+                self.show_github_error(self.github_error)
+        else:
+            self.status.setText("Выберите папку репозитория, чтобы начать.")
 
     def choose_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Выберите папку Git-репозитория", self.folder.text())
@@ -115,34 +156,74 @@ class MainWindow(QMainWindow):
             self.folder.setText(folder)
 
     def check_changes(self):
-        if self.worker is not None:
+        if self.worker is not None or self.mode.currentIndex() == 0:
             return
         folder = self.folder.text()
         if not folder:
             self.status.setText("Укажите папку Git-репозитория.")
             return
-        self.changed.clear()
-        self.changed_title.setText("Изменённые файлы относительно HEAD")
-        self.graph.scene().clear()
-        self.affected.clear()
-        self.warnings.clear()
-        self.tabs.setTabText(1, "Затронутые файлы")
-        self.tabs.setTabText(2, "Предупреждения")
+        self.clear_result()
         self.tabs.setCurrentIndex(0)
         self.status.setText("Проверяю изменения…")
-        for control in (self.folder, self.choose, self.check):
-            control.setEnabled(False)
+        self.start_analysis(Path(os.path.expanduser(folder)))
 
-        self.worker = AnalysisThread(Path(os.path.expanduser(folder)), self.analyzer, self)
+    def refresh_github(self):
+        if self.worker is not None or self.mode.currentIndex() != 0:
+            return
+        self.status.setText("Обновляю данные с GitHub и проверяю изменения…")
+        self.start_analysis(None)
+
+    def clear_result(self):
+        self.changed.clear()
+        self.changed_title.setText(
+            "Изменённые файлы" if self.mode.currentIndex() == 0 else "Изменённые файлы относительно HEAD"
+        )
+        self.graph.scene().clear()
+        self.affected.clear()
+        self.tabs.setTabText(1, "Затронутые файлы")
+        self.show_warnings([])
+
+    def start_analysis(self, folder: Path | None):
+        self.set_controls_enabled(False)
+        self.worker = AnalysisThread(folder, self.cache, self.analyzer, self)
         self.worker.changes_found.connect(self.show_changes)
         self.worker.result_ready.connect(self.show_result)
-        self.worker.failed.connect(self.show_error)
+        self.worker.github_ready.connect(self.accept_github_result)
+        self.worker.failed.connect(self.show_github_error if folder is None else self.show_error)
         self.worker.finished.connect(self.analysis_finished)
         self.worker.start()
 
     def show_changes(self, changes: list[str]):
         self.changed.addItems([display_path(path) for path in changes])
-        self.changed_title.setText(f"Изменённые файлы относительно HEAD ({len(changes)})")
+        title = "Изменённые файлы" if self.mode.currentIndex() == 0 else "Изменённые файлы относительно HEAD"
+        self.changed_title.setText(f"{title} ({len(changes)})")
+
+    def accept_github_result(self, result: GitHubResult):
+        self.github_result = result
+        self.github_error = None
+        self.show_github_result(result)
+
+    def show_github_result(self, result: GitHubResult):
+        self.clear_result()
+        self.github_source.setText(f"{REPOSITORY} / {BRANCH} · {result.commit}")
+        self.show_changes(result.changes)
+        if result.response is None:
+            self.status.setText("В ветке только один коммит. Сравнивать пока не с чем.")
+        else:
+            self.show_result(result.response, result.example)
+
+    def show_github_error(self, message: str):
+        self.github_error = message
+        result = self.github_result
+        warnings = result.response["warnings"] if result is not None and result.response is not None else []
+        self.show_warnings([message, *warnings])
+        if result is None:
+            self.status.setText("Не удалось проверить GitHub. Подробности во вкладке «Предупреждения».")
+            self.tabs.setCurrentWidget(self.warnings)
+        else:
+            self.status.setText(
+                "Обновление не удалось. Показан предыдущий результат. Подробности во вкладке «Предупреждения»."
+            )
 
     def show_result(self, response: dict, example: bool):
         self.graph.show_result(response)
@@ -151,10 +232,8 @@ class MainWindow(QMainWindow):
             self.affected.addTopLevelItem(
                 QTreeWidgetItem([display_path(item["path"]), str(item["distance"]), item["reason"]])
             )
-        warnings = response["warnings"]
-        self.warnings.addItems(warnings)
         self.tabs.setTabText(1, f"Затронутые файлы ({len(affected)})")
-        self.tabs.setTabText(2, f"Предупреждения ({len(warnings)})")
+        self.show_warnings(response["warnings"])
         self.status.setText(
             "Анализатор не найден. Во вкладках показан пример JSON, слева — изменения репозитория."
             if example else "Проверка завершена."
@@ -162,15 +241,23 @@ class MainWindow(QMainWindow):
 
     def show_error(self, message: str):
         self.status.setText("Проверка завершилась с ошибкой. Подробности во вкладке «Предупреждения».")
-        self.warnings.addItem(message)
-        self.tabs.setTabText(2, "Предупреждения (1)")
+        self.show_warnings([message])
         self.tabs.setCurrentWidget(self.warnings)
+
+    def show_warnings(self, warnings: list[str]):
+        self.warnings.clear()
+        self.warnings.addItems(warnings)
+        title = f"Предупреждения ({len(warnings)})" if warnings else "Предупреждения"
+        self.tabs.setTabText(2, title)
 
     def analysis_finished(self):
         self.worker.deleteLater()
         self.worker = None
-        for control in (self.folder, self.choose, self.check):
-            control.setEnabled(True)
+        self.set_controls_enabled(True)
+
+    def set_controls_enabled(self, enabled: bool):
+        for control in (self.mode, self.folder, self.choose, self.check, self.refresh):
+            control.setEnabled(enabled)
 
     def closeEvent(self, event):
         if self.worker is not None:
@@ -180,12 +267,14 @@ class MainWindow(QMainWindow):
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="ImpactMap для локальных Git-репозиториев")
+    parser = argparse.ArgumentParser(description="ImpactMap для GitHub и локальных Git-репозиториев")
     parser.add_argument("--analyzer", default=os.environ.get("IMPACTMAP_ANALYZER"), help="путь к Rust-анализатору")
     args = parser.parse_args()
     app = QApplication([])
+    app.setApplicationName("ImpactMap")
     window = MainWindow(args.analyzer)
     window.show()
+    QTimer.singleShot(0, window.refresh_github)
     return app.exec()
 
 
