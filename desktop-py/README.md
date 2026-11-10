@@ -6,7 +6,15 @@
 
 Выполните команды из корня ImpactMap.
 
-**Linux**
+**Fedora Linux**
+
+```sh
+sudo dnf install git python3-pyside6
+cd desktop-py
+python3 main.py
+```
+
+**Другие дистрибутивы Linux**
 
 ```sh
 cd desktop-py
