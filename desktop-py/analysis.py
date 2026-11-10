@@ -8,6 +8,8 @@ import subprocess
 PROTOCOL_VERSION = 1
 EXAMPLE = Path(__file__).with_name("example.json")
 PROCESS_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+ANALYZER_NAME = "impactmap-analyzer.exe" if os.name == "nt" else "impactmap-analyzer"
+BUILT_ANALYZER = Path(__file__).resolve().parents[1] / "analyzer-rs" / "target" / "release" / ANALYZER_NAME
 
 
 class AnalysisError(Exception):
@@ -48,7 +50,7 @@ def repository_changes(folder: Path) -> tuple[Path, list[str]]:
 
 def find_analyzer(setting: str | None) -> Path | None:
     if not setting:
-        return None
+        return BUILT_ANALYZER if BUILT_ANALYZER.is_file() else None
     executable = Path(os.path.expanduser(setting))
     if executable.is_file():
         return executable.resolve()
@@ -120,5 +122,11 @@ def analyze(repo: Path, changes: list[str], setting: str | None) -> tuple[dict, 
         raise AnalysisError("Анализатор не ответил за 60 секунд.") from exc
     if result.returncode:
         message = result.stderr.decode("utf-8", errors="replace").strip()
-        raise AnalysisError(f"Анализатор завершился с кодом {result.returncode}. {message}")
+        try:
+            warnings = parse_response(result.stdout)["warnings"]
+        except AnalysisError:
+            warnings = []
+        details = "\n".join([*warnings, message]).strip()
+        summary = f"Анализатор завершился с кодом {result.returncode}."
+        raise AnalysisError(f"{summary}\n{details}" if details else summary)
     return parse_response(result.stdout), False
