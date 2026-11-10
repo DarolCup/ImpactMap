@@ -18,6 +18,7 @@ struct Analyzer<'a> {
     graph: &'a mut Graph,
     file: &'a str,
     roots: &'a [&'a str],
+    evidence: String,
 }
 
 impl Analyzer<'_> {
@@ -91,7 +92,7 @@ impl Analyzer<'_> {
     fn record(&mut self, module: &str, resolution: &Resolution) {
         match resolution {
             Resolution::Found { files, namespace, .. } => {
-                for target in files { self.graph.edge(self.file, target); }
+                for target in files { self.graph.reference(self.file, target, None, &self.evidence); }
                 if *namespace {
                     self.graph.warn(self.file, format!("Python namespace package {module}: local portion inferred; runtime search paths are unknown"));
                 }
@@ -104,6 +105,17 @@ impl Analyzer<'_> {
     fn from(&mut self, node: ast::StmtImportFrom) {
         let level = node.level.map_or(0, |n| n.to_usize());
         let module = node.module.as_ref().map_or("", |n| n.as_str());
+        self.evidence = format!(
+            "from {}{} import {}",
+            ".".repeat(level),
+            module,
+            node.names
+                .iter()
+                .map(|a| a.name.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        self.graph.import(self.file, &self.evidence);
         let (root, base) = if level > 0 {
             let root = if self.roots.contains(&"src") && self.file.starts_with("src/") {
                 "src"
@@ -150,6 +162,16 @@ impl Analyzer<'_> {
                 self.graph.warn(self.file, format!("Python wildcard import from {base}: base dependency recorded; __all__ and re-exports are not evaluated"));
                 continue;
             }
+            if let Resolution::Found { files, .. } = &resolution {
+                if let Some(target) = files.last() {
+                    self.graph.reference(
+                        self.file,
+                        target,
+                        Some(alias.name.to_string()),
+                        &self.evidence,
+                    );
+                }
+            }
             let name = if base.is_empty() {
                 alias.name.to_string()
             } else {
@@ -174,6 +196,8 @@ impl Analyzer<'_> {
 impl Visitor for Analyzer<'_> {
     fn visit_stmt_import(&mut self, node: ast::StmtImport) {
         for alias in node.names {
+            self.evidence = format!("import {}", alias.name);
+            self.graph.import(self.file, &self.evidence);
             let resolution = self.absolute(alias.name.as_str());
             self.record(alias.name.as_str(), &resolution);
         }
@@ -215,6 +239,7 @@ pub(super) fn analyze(files: &Files, graph: &mut Graph) {
                     graph,
                     file: path,
                     roots: &roots,
+                    evidence: String::new(),
                 };
                 for stmt in suite {
                     analyzer.visit_stmt(stmt);

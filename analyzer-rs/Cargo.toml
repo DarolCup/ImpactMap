@@ -12,5 +12,6 @@ syn = { version = "2", features = ["full", "visit"] }
 rustpython-parser = { version = "0.4", default-features = false, features = ["num-bigint"] }
 rustpython-ast = { version = "0.4", default-features = false, features = ["num-bigint", "visitor"] }
 toml = "0.8"
+quote = "1"
 
 [workspace]
