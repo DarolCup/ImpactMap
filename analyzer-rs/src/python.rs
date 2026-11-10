@@ -1,6 +1,7 @@
 use crate::{join, parent, Files, Graph};
 use rustpython_ast::{self as ast, Visitor};
 use rustpython_parser::Parse;
+use std::collections::BTreeSet;
 
 #[derive(Clone)]
 enum Resolution {
@@ -19,6 +20,7 @@ struct Analyzer<'a> {
     file: &'a str,
     roots: &'a [&'a str],
     evidence: String,
+    external: &'a BTreeSet<String>,
 }
 
 impl Analyzer<'_> {
@@ -94,9 +96,11 @@ impl Analyzer<'_> {
             Resolution::Found { files, namespace, .. } => {
                 for target in files { self.graph.reference(self.file, target, None, &self.evidence); }
                 if *namespace {
-                    self.graph.warn(self.file, format!("Python namespace package {module}: local portion inferred; runtime search paths are unknown"));
+                    self.graph.limit(self.file, format!("Python namespace package {module}: local portion inferred; runtime search paths are unknown"));
                 }
             }
+            Resolution::Missing if self.external.contains(&module.split('.').next().unwrap_or("").to_lowercase().replace('-', "_"))
+                && matches!(self.absolute(module.split('.').next().unwrap_or("")), Resolution::Missing) => (),
             Resolution::Missing => self.graph.warn(self.file, format!("Cannot resolve Python import {module} locally (external/missing module or unsupported search path)")),
             Resolution::Ambiguous => self.graph.warn(self.file, format!("Ambiguous Python import {module}; multiple local candidates, no dependency inferred")),
         }
@@ -117,9 +121,13 @@ impl Analyzer<'_> {
         );
         self.graph.import(self.file, &self.evidence);
         let (root, base) = if level > 0 {
-            let root = self.roots.iter().copied()
+            let root = self
+                .roots
+                .iter()
+                .copied()
                 .filter(|root| !root.is_empty() && self.file.starts_with(&format!("{root}/")))
-                .max_by_key(|root| root.len()).unwrap_or("");
+                .max_by_key(|root| root.len())
+                .unwrap_or("");
             let local = if root.is_empty() {
                 self.file
             } else {
@@ -178,14 +186,14 @@ impl Analyzer<'_> {
             if package {
                 let child = resolve(self, &name);
                 match child {
-                    Resolution::Missing => self.graph.warn(self.file, format!("Python symbol {name}: base dependency recorded; dynamic attributes and re-export targets are unknown")),
+                    Resolution::Missing => self.graph.limit(self.file, format!("Python symbol {name}: base dependency recorded; dynamic attributes and re-export targets are unknown")),
                     _ => {
                         self.record(&name, &child);
-                        self.graph.warn(self.file, format!("Python from-import {name}: local submodule candidate recorded; package attributes/re-exports may shadow it"));
+                        self.graph.limit(self.file, format!("Python from-import {name}: local submodule candidate recorded; package attributes/re-exports may shadow it"));
                     }
                 }
             } else {
-                self.graph.warn(self.file, format!("Python symbol {name}: defining module dependency recorded; re-export targets are unknown"));
+                self.graph.limit(self.file, format!("Python symbol {name}: defining module dependency recorded; re-export targets are unknown"));
             }
         }
     }
@@ -222,29 +230,83 @@ impl Visitor for Analyzer<'_> {
 }
 
 pub(super) fn analyze(files: &Files, graph: &mut Graph) {
+    let mut external: BTreeSet<String> = include_str!("python_stdlib.txt")
+        .lines()
+        .filter(|s| !s.starts_with('#'))
+        .map(String::from)
+        .collect();
+    fn requirement_name(value: &str) -> Option<String> {
+        let name = value
+            .trim()
+            .split(['[', '<', '>', '=', '!', '~', ';', ' ', '@'])
+            .next()?;
+        if name.is_empty() || name.starts_with(['-', '#']) {
+            return None;
+        }
+        Some(name.to_lowercase().replace('-', "_"))
+    }
+    for (path, text) in files {
+        let name = path.rsplit('/').next().unwrap();
+        if name.starts_with("requirements") && name.ends_with(".txt") {
+            external.extend(text.lines().filter_map(requirement_name));
+        } else if name == "pyproject.toml" {
+            if let Ok(value) = toml::from_str::<toml::Value>(text) {
+                if let Some(deps) = value
+                    .get("project")
+                    .and_then(|p| p.get("dependencies"))
+                    .and_then(|v| v.as_array())
+                {
+                    external.extend(
+                        deps.iter()
+                            .filter_map(|v| v.as_str())
+                            .filter_map(requirement_name),
+                    );
+                }
+            }
+        }
+    }
     let has_src = files
         .keys()
         .any(|p| p.starts_with("src/") && p.ends_with(".py"));
-    let mut root_names: Vec<String> = if has_src { vec!["".into(), "src".into()] } else { vec!["".into()] };
+    let mut root_names: Vec<String> = if has_src {
+        vec!["".into(), "src".into()]
+    } else {
+        vec!["".into()]
+    };
     if let Some(config) = files.get(".impactmap.json") {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
-        struct Config { python_source_roots: Vec<String> }
+        struct Config {
+            python_source_roots: Vec<String>,
+        }
         let configured = serde_json::from_str::<Config>(config)
             .map_err(|e| e.to_string())
-            .and_then(|config| config.python_source_roots.iter().map(|p| {
-                if p == "." { Ok(String::new()) } else { crate::relative(p) }
-            }).collect::<Result<Vec<_>, _>>());
+            .and_then(|config| {
+                config
+                    .python_source_roots
+                    .iter()
+                    .map(|p| {
+                        if p == "." {
+                            Ok(String::new())
+                        } else {
+                            crate::relative(p)
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            });
         match configured {
             Ok(extra) => root_names.extend(extra),
-            Err(e) => graph.warn(".impactmap.json", format!("Invalid Python source roots; using defaults: {e}")),
+            Err(e) => graph.warn(
+                ".impactmap.json",
+                format!("Invalid Python source roots; using defaults: {e}"),
+            ),
         }
     }
     root_names.sort();
     root_names.dedup();
     let roots: Vec<&str> = root_names.iter().map(String::as_str).collect();
     if has_src {
-        graph.warn("src", "Python absolute imports use repository root and src/ as candidate source roots; runtime sys.path is not evaluated");
+        graph.limit("src", "Python absolute imports use repository root and src/ as candidate source roots; runtime sys.path is not evaluated");
     }
     for (path, text) in files.iter().filter(|(p, _)| p.ends_with(".py")) {
         match ast::Suite::parse(text, path) {
@@ -255,6 +317,7 @@ pub(super) fn analyze(files: &Files, graph: &mut Graph) {
                     file: path,
                     roots: &roots,
                     evidence: String::new(),
+                    external: &external,
                 };
                 for stmt in suite {
                     analyzer.visit_stmt(stmt);

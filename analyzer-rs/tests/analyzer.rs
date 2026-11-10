@@ -8,38 +8,149 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 #[test]
+fn debug_external_rust_dependencies_are_not_errors() {
+    let repo = Repo::new(&[
+        ("Cargo.toml", "[package]\nname='demo'\nversion='0.1.0'\n[dependencies]\nserde='1'\nrenamed={package='some-package',version='1'}\n"),
+        ("src/lib.rs", "use std::collections::HashMap; use serde::Serialize; use renamed::Thing;"),
+    ]);
+    let out = repo.run(&[]);
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    assert!(out.edges.is_empty());
+}
+
+#[test]
+fn debug_python_external_packages_and_configured_siblings() {
+    let repo = Repo::new(&[
+        (".impactmap.json", r#"{"python_source_roots":["desktop-py"]}"#),
+        ("desktop-py/requirements.txt", "PySide6>=6.8,<7\n"),
+        ("desktop-py/main.py", "import os\nfrom pathlib import Path\nfrom PySide6.QtCore import Qt\nfrom analysis import analyze\n"),
+        ("desktop-py/analysis.py", "def analyze():\n    pass\n"),
+        ("README.md", "Documentation"),
+    ]);
+    let out = repo.run(&["README.md"]);
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    assert!(edge(&out, "desktop-py/main.py", "desktop-py/analysis.py"));
+}
+
+#[test]
+fn debug_syntax_errors_and_missing_local_imports_remain_visible() {
+    let repo = Repo::new(&[
+        ("src/lib.rs", "mod missing; use crate::missing::Thing;"),
+        ("app.py", "from . import lost\n"),
+        ("broken.py", "def ?"),
+    ]);
+    let out = repo.run(&[]);
+    for text in ["mod missing", "crate::missing", "beyond", "Python syntax"] {
+        assert!(
+            out.warnings.iter().any(|w| w.contains(text)),
+            "{text}: {:?}",
+            out.warnings
+        );
+    }
+}
+
+#[test]
+fn external_names_do_not_hide_local_shadowing_or_path_dependencies() {
+    let repo = Repo::new(&[
+        (
+            "Cargo.toml",
+            "[package]\nname='demo'\nversion='0.1.0'\n[dependencies]\nlocal={path='missing'}\n",
+        ),
+        (
+            "src/lib.rs",
+            "use local::Thing; mod std; use std::missing::Thing;",
+        ),
+        ("src/std.rs", ""),
+        ("app.py", "import os.missing\n"),
+        ("os.py", ""),
+    ]);
+    let out = repo.run(&[]);
+    for import in ["local::Thing", "std::missing", "os.missing"] {
+        assert!(
+            out.warnings.iter().any(|w| w.contains(import)),
+            "{import}: {:?}",
+            out.warnings
+        );
+    }
+}
+
+#[test]
+fn python_project_dependencies_are_metadata_not_executed_code() {
+    let repo = Repo::new(&[
+        (
+            "pyproject.toml",
+            "[project]\nname='demo'\ndependencies=['My-Package>=1']\n",
+        ),
+        ("app.py", "import my_package\nimport unknown_local\n"),
+    ]);
+    let out = repo.run(&[]);
+    assert_eq!(out.warnings.len(), 1);
+    assert!(out.warnings[0].contains("unknown_local"));
+}
+
+#[test]
 fn planning_inventory_includes_isolated_sources_and_excludes_historical_edges() {
     let before = Repo::new(&[("app.py", "import helpers\n"), ("helpers.py", "")]);
-    let after = Repo::new(&[("app.py", "import helpers\n"), ("isolated.py", ""), ("README.md", "hello")]);
-    let out = compare(&before, &after, serde_json::json!([{"path":"helpers.py","status":"deleted"}]));
+    let after = Repo::new(&[
+        ("app.py", "import helpers\n"),
+        ("isolated.py", ""),
+        ("README.md", "hello"),
+    ]);
+    let out = compare(
+        &before,
+        &after,
+        serde_json::json!([{"path":"helpers.py","status":"deleted"}]),
+    );
     assert_eq!(out.files, ["app.py", "isolated.py"]);
     assert!(out.current_edges.is_empty());
     assert_eq!(out.edges.len(), 1);
-    assert_eq!(out.analyzer_version, "0.0.3");
+    assert_eq!(out.analyzer_version, env!("CARGO_PKG_VERSION"));
 }
 
 #[test]
 fn configured_python_roots_support_scripts_and_relative_packages() {
     let repo = Repo::new(&[
-        (".impactmap.json", r#"{"python_source_roots":["desktop-py"]}"#),
-        ("desktop-py/main.py", "from helpers import greet\nimport pkg.child\n"),
+        (
+            ".impactmap.json",
+            r#"{"python_source_roots":["desktop-py"]}"#,
+        ),
+        (
+            "desktop-py/main.py",
+            "from helpers import greet\nimport pkg.child\n",
+        ),
         ("desktop-py/helpers.py", "def greet(): pass\n"),
         ("desktop-py/pkg/__init__.py", ""),
         ("desktop-py/pkg/child.py", "from . import sibling\n"),
         ("desktop-py/pkg/sibling.py", ""),
     ]);
-    assert_eq!(repo.run(&["desktop-py/helpers.py"]).affected_files[0].path, "desktop-py/main.py");
+    assert_eq!(
+        repo.run(&["desktop-py/helpers.py"]).affected_files[0].path,
+        "desktop-py/main.py"
+    );
     let out = repo.run(&["desktop-py/pkg/sibling.py"]);
-    assert!(out.current_edges.iter().any(|e| e.from == "desktop-py/pkg/child.py" && e.to == "desktop-py/pkg/sibling.py"));
+    assert!(out
+        .current_edges
+        .iter()
+        .any(|e| e.from == "desktop-py/pkg/child.py" && e.to == "desktop-py/pkg/sibling.py"));
 }
 
 #[test]
 fn invalid_python_root_config_warns_without_following_outside_paths() {
-    for config in [r#"{"python_source_roots":["../outside"]}"#, r#"{"python_source_roots":"bad"}"#] {
-        let repo = Repo::new(&[(".impactmap.json", config), ("a.py", "import b\n"), ("b.py", "")]);
+    for config in [
+        r#"{"python_source_roots":["../outside"]}"#,
+        r#"{"python_source_roots":"bad"}"#,
+    ] {
+        let repo = Repo::new(&[
+            (".impactmap.json", config),
+            ("a.py", "import b\n"),
+            ("b.py", ""),
+        ]);
         let out = repo.run(&["b.py"]);
         assert_eq!(out.affected_files[0].path, "a.py");
-        assert!(out.warnings.iter().any(|w| w.contains("Invalid Python source roots")));
+        assert!(out
+            .warnings
+            .iter()
+            .any(|w| w.contains("Invalid Python source roots")));
     }
 }
 
@@ -458,7 +569,7 @@ fn rust_ambiguity_and_external_imports_warn() {
         .warnings
         .iter()
         .any(|w| w.contains("2 local source files")));
-    assert!(out.warnings.iter().any(|w| w.contains("std::collections")));
+    assert!(!out.warnings.iter().any(|w| w.contains("std::collections")));
     assert!(out.warnings.iter().any(|w| w.contains("crate::missing")));
 }
 
@@ -473,7 +584,7 @@ fn rust_macros_cfg_and_reexports_warn() {
     ]);
     let out = repo.run(&[]);
     for word in ["Conditional", "re-export", "macro"] {
-        assert!(out.warnings.iter().any(|w| w.contains(word)));
+        assert!(out.impact.limitations.iter().any(|w| w.contains(word)));
     }
 }
 
@@ -505,7 +616,11 @@ fn python_import_aliases_multiline_and_nested_imports() {
         assert!(edge(&out, "app.py", target));
     }
     assert_eq!(distance(&out, "app.py"), Some(1));
-    assert!(out.warnings.iter().any(|w| w.contains("may shadow")));
+    assert!(out
+        .impact
+        .limitations
+        .iter()
+        .any(|w| w.contains("may shadow")));
 }
 
 #[test]
@@ -560,7 +675,11 @@ fn python_symbols_and_wildcards_record_base_and_warn() {
     let out = repo.run(&[]);
     assert!(edge(&out, "app.py", "data.py"));
     assert!(edge(&out, "app.py", "pkg/__init__.py"));
-    assert!(out.warnings.iter().any(|w| w.contains("re-export")));
+    assert!(out
+        .impact
+        .limitations
+        .iter()
+        .any(|w| w.contains("re-export")));
     assert!(out.warnings.iter().any(|w| w.contains("wildcard")));
 }
 
@@ -574,7 +693,11 @@ fn python_src_layout_and_namespace_packages() {
     let out = repo.run(&["src/pkg/data.py"]);
     assert!(edge(&out, "src/pkg/worker.py", "src/pkg/data.py"));
     assert_eq!(distance(&out, "app.py"), Some(2));
-    assert!(out.warnings.iter().any(|w| w.contains("namespace")));
+    assert!(out
+        .impact
+        .limitations
+        .iter()
+        .any(|w| w.contains("namespace")));
 }
 
 #[test]

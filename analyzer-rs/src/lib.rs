@@ -74,6 +74,7 @@ impl Output {
 struct Graph {
     edges: BTreeSet<Edge>,
     warnings: BTreeSet<String>,
+    limitations: BTreeSet<String>,
     references: Vec<Reference>,
     imports: BTreeSet<(String, String)>,
 }
@@ -87,6 +88,10 @@ struct Reference {
 }
 
 impl Graph {
+    fn limit(&mut self, file: &str, message: impl AsRef<str>) {
+        self.limitations
+            .insert(format!("{file}: {}", message.as_ref()));
+    }
     fn reference(&mut self, from: &str, to: &str, symbol: Option<String>, evidence: &str) {
         self.edge(from, to);
         self.references.push(Reference {
@@ -223,6 +228,12 @@ fn scan(root: &Path, dir: &Path, files: &mut Files, graph: &mut Graph) {
         } else if path.extension().is_some_and(|e| e == "rs" || e == "py")
             || entry.file_name() == "Cargo.toml"
             || rel == ".impactmap.json"
+            || entry.file_name() == "pyproject.toml"
+            || (entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("requirements")
+                && path.extension().is_some_and(|e| e == "txt"))
         {
             match fs::read_to_string(&path) {
                 Ok(text) => {
@@ -307,6 +318,12 @@ pub fn analyze(input: Input) -> Result<Output, String> {
         impact
             .limitations
             .extend(previous.warnings.iter().map(|w| format!("Baseline: {w}")));
+        impact.limitations.extend(
+            previous
+                .limitations
+                .iter()
+                .map(|w| format!("Baseline: {w}")),
+        );
         if baseline == root {
             impact.limitations.push("Baseline and current repository are the same directory; no independent previous snapshot is available".into());
         }
@@ -330,11 +347,17 @@ pub fn analyze(input: Input) -> Result<Output, String> {
         impact.limitations.push("No baseline_repo_path: deleted/renamed dependencies and public symbol changes cannot be verified".into());
     }
     for path in &changed {
-        if !files.contains_key(path) {
+        if !files.contains_key(path) && (path.ends_with(".rs") || path.ends_with(".py")) {
             graph.warn(path, "Changed file is absent, excluded or unsupported; baseline may be needed to recover dependencies");
+        } else if !path.ends_with(".rs") && !path.ends_with(".py") {
+            graph.limit(
+                path,
+                "This file type does not participate in the Rust/Python dependency graph",
+            );
         }
     }
     impact.limitations.extend(graph.warnings.iter().cloned());
+    impact.limitations.extend(graph.limitations.iter().cloned());
     impact.limitations.sort();
     impact.limitations.dedup();
     let mut reverse: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
@@ -393,7 +416,11 @@ pub fn analyze(input: Input) -> Result<Output, String> {
     Ok(Output {
         protocol_version: 1,
         analyzer_version: env!("CARGO_PKG_VERSION").into(),
-        files: files.keys().filter(|p| p.ends_with(".rs") || p.ends_with(".py")).cloned().collect(),
+        files: files
+            .keys()
+            .filter(|p| p.ends_with(".rs") || p.ends_with(".py"))
+            .cloned()
+            .collect(),
         current_edges,
         changed_files: changed.into_iter().collect(),
         affected_files,
