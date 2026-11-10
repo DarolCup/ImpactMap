@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
@@ -16,7 +17,7 @@ class AnalysisError(Exception):
     pass
 
 
-def git(repo: Path, *args: str, env: dict[str, str] | None = None, timeout: int = 30) -> bytes:
+def git(repo: Path, *args: str, env: dict[str, str] | None = None, timeout: int = 30, diff: bool = False) -> bytes:
     env = {**(os.environ if env is None else env), "GIT_NO_LAZY_FETCH": "1", "GIT_OPTIONAL_LOCKS": "0"}
     try:
         result = subprocess.run(
@@ -30,7 +31,7 @@ def git(repo: Path, *args: str, env: dict[str, str] | None = None, timeout: int 
         raise AnalysisError("Git не найден в PATH.") from exc
     except subprocess.TimeoutExpired as exc:
         raise AnalysisError(f"Git не ответил за {timeout} секунд.") from exc
-    if result.returncode:
+    if result.returncode and not (diff and result.returncode == 1):
         message = os.fsdecode(result.stderr).strip()
         raise AnalysisError(f"Ошибка Git: {message or result.returncode}")
     return result.stdout
@@ -41,14 +42,62 @@ def git_paths(output: bytes) -> list[str]:
     return sorted({os.fsdecode(path) for path in output.split(b"\0") if path})
 
 
-def repository_changes(folder: Path) -> tuple[Path, list[str]]:
-    root_output = git(folder, "rev-parse", "--show-toplevel").removesuffix(b"\n")
-    if os.name == "nt":
-        root_output = root_output.removesuffix(b"\r")
-    root = Path(os.fsdecode(root_output))
-    tracked = git(root, "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "HEAD", "--")
-    untracked = git(root, "ls-files", "--others", "--exclude-standard", "-z")
-    return root, git_paths(tracked + untracked)
+@dataclass(frozen=True)
+class Change:
+    path: str
+    status: str
+    old_path: str | None = None
+
+    def request(self) -> dict:
+        result = {"path": self.path, "status": self.status}
+        if self.old_path is not None:
+            result["old_path"] = self.old_path
+        return result
+
+
+@dataclass
+class AnalysisResult:
+    source: str
+    comparison: str
+    changes: list[Change]
+    response: dict
+    notes: tuple[str, ...] = ()
+
+
+def parse_changes(output: bytes, snapshot_paths: bool = False) -> list[Change]:
+    fields = iter(os.fsdecode(output).split("\0"))
+    changes = []
+    statuses = {"A": "added", "M": "modified", "D": "deleted", "T": "modified"}
+    for status in fields:
+        if not status:
+            break
+        path = next(fields)
+        if status.startswith("R"):
+            new_path = next(fields)
+            changes.append(Change(
+                new_path.removeprefix("after/") if snapshot_paths else new_path,
+                "renamed",
+                path.removeprefix("before/") if snapshot_paths else path,
+            ))
+        else:
+            if snapshot_paths:
+                path = path.removeprefix("after/" if status == "A" else "before/")
+            changes.append(Change(path, statuses[status]))
+    return sorted(changes, key=lambda item: item.path)
+
+
+def isolated_git_env() -> dict[str, str]:
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    return {**env, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0"}
+
+
+def checkout_snapshot(repository: Path, commit: str, destination: Path, env: dict) -> None:
+    destination.mkdir()
+    private_env = {**env, "GIT_INDEX_FILE": str(destination.with_suffix(".index"))}
+    work_tree = f"--work-tree={destination}"
+    git(repository, work_tree, "read-tree", commit, env=private_env)
+    git(repository, work_tree, "checkout-index", "--all", env=private_env)
 
 
 def find_analyzer(setting: str | None) -> Path | None:
@@ -95,15 +144,50 @@ def parse_response(data: bytes) -> dict:
                 valid = isinstance(item, schema)
             if not valid:
                 raise AnalysisError(f"Некорректный элемент в поле «{name}» ответа анализатора.")
+    for item in response["affected_files"]:
+        if not strings(item.get("chain")):
+            item.pop("chain", None)
+
+    impact = response.get("impact")
+    if isinstance(impact, dict):
+        findings = impact.get("findings")
+        limitations = impact.get("limitations")
+        response["impact"] = {
+            "findings": [item for item in findings if valid_finding(item)] if isinstance(findings, list) else [],
+            "limitations": [item for item in limitations if isinstance(item, str)] if isinstance(limitations, list) else [],
+        }
+    else:
+        response.pop("impact", None)
     return response
 
 
-def analyze(repo: Path, changes: list[str], setting: str | None) -> tuple[dict, bool]:
+def strings(value) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def valid_finding(item) -> bool:
+    return isinstance(item, dict) and strings(item.get("paths")) and all(
+        isinstance(item.get(key), str) for key in ("code", "severity", "confidence", "evidence")
+    )
+
+
+def analyze(repo: Path, baseline: Path, changes: list[Change], setting: str | None) -> dict:
     executable = find_analyzer(setting)
     if executable is None:
-        return parse_response(EXAMPLE.read_bytes()), True
+        raise AnalysisError(
+            "Не найден анализатор ImpactMap. Соберите его по инструкции в README "
+            "или задайте путь через --analyzer. Пока можно посмотреть учебный пример."
+        )
 
-    request = {"protocol_version": PROTOCOL_VERSION, "repo_path": repo.as_posix(), "changed_files": changes}
+    # Older v1 analyzers need both names to see dependencies around a rename.
+    changed_files = sorted({path for change in changes for path in (change.path, change.old_path) if path})
+    request = {
+        "protocol_version": PROTOCOL_VERSION,
+        "repo_path": repo.as_posix(),
+        "baseline_repo_path": baseline.as_posix(),
+        "changed_files": changed_files,
+        "changes": [change.request() for change in changes],
+    }
     try:
         payload = json.dumps(request, ensure_ascii=False).encode("utf-8")
     except UnicodeError as exc:
@@ -117,10 +201,6 @@ def analyze(repo: Path, changes: list[str], setting: str | None) -> tuple[dict, 
             timeout=60,
             creationflags=PROCESS_FLAGS,
         )
-    except FileNotFoundError:
-        if not executable.exists():
-            return parse_response(EXAMPLE.read_bytes()), True
-        raise
     except subprocess.TimeoutExpired as exc:
         raise AnalysisError("Анализатор не ответил за 60 секунд.") from exc
     if result.returncode:
@@ -132,4 +212,4 @@ def analyze(repo: Path, changes: list[str], setting: str | None) -> tuple[dict, 
         details = "\n".join([*warnings, message]).strip()
         summary = f"Анализатор завершился с кодом {result.returncode}."
         raise AnalysisError(f"{summary}\n{details}" if details else summary)
-    return parse_response(result.stdout), False
+    return parse_response(result.stdout)
