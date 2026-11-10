@@ -7,6 +7,269 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
+fn compare(before: &Repo, after: &Repo, changes: serde_json::Value) -> Output {
+    analyze(
+        serde_json::from_value(serde_json::json!({
+            "protocol_version":1,"repo_path":after.0,"baseline_repo_path":before.0,
+            "changes":changes
+        }))
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn three_file_chain_and_stable_ties_with_cycles() {
+    let repo = Repo::new(&[
+        ("runner.py", "import app\nimport alt\n"),
+        ("app.py", "import helpers\nimport runner\n"),
+        ("alt.py", "import helpers\n"),
+        ("helpers.py", ""),
+    ]);
+    let out = repo.run(&["helpers.py"]);
+    let runner = out
+        .affected_files
+        .iter()
+        .find(|a| a.path == "runner.py")
+        .unwrap();
+    assert_eq!(runner.chain, ["runner.py", "alt.py", "helpers.py"]);
+    assert_eq!(runner.chain.len(), runner.distance + 1);
+    let out = repo.run(&["helpers.py", "app.py"]);
+    assert_eq!(
+        out.affected_files
+            .iter()
+            .find(|a| a.path == "runner.py")
+            .unwrap()
+            .chain,
+        ["runner.py", "app.py"]
+    );
+    let simple = Repo::new(&[
+        ("runner.py", "import app\n"),
+        ("app.py", "import helpers\n"),
+        ("helpers.py", ""),
+    ]);
+    assert_eq!(
+        simple
+            .run(&["helpers.py"])
+            .affected_files
+            .iter()
+            .find(|a| a.path == "runner.py")
+            .unwrap()
+            .chain,
+        ["runner.py", "app.py", "helpers.py"]
+    );
+}
+
+#[test]
+fn deleted_dependency_retains_historical_chain() {
+    let before = Repo::new(&[
+        ("runner.py", "import app\n"),
+        ("app.py", "import helpers\n"),
+        ("helpers.py", ""),
+    ]);
+    let after = Repo::new(&[
+        ("runner.py", "import app\n"),
+        ("app.py", "import helpers\n"),
+    ]);
+    let out = compare(
+        &before,
+        &after,
+        serde_json::json!([{"path":"helpers.py","status":"deleted"}]),
+    );
+    let finding = out
+        .impact
+        .findings
+        .iter()
+        .find(|f| f.code == "deleted_dependency")
+        .unwrap();
+    assert_eq!(finding.confidence, "confirmed");
+    assert!(finding.evidence.contains("import helpers"));
+    assert_eq!(finding.paths, ["app.py", "helpers.py"]);
+    assert_eq!(
+        out.affected_files
+            .iter()
+            .find(|a| a.path == "runner.py")
+            .unwrap()
+            .chain,
+        ["runner.py", "app.py", "helpers.py"]
+    );
+}
+
+#[test]
+fn renamed_dependency_requires_stale_import() {
+    let before = Repo::new(&[("app.py", "import helpers\n"), ("helpers.py", "")]);
+    let after = Repo::new(&[("app.py", "import helpers\n"), ("utils.py", "")]);
+    let changes =
+        serde_json::json!([{"path":"utils.py","old_path":"helpers.py","status":"renamed"}]);
+    let out = compare(&before, &after, changes.clone());
+    assert_eq!(out.impact.findings[0].code, "renamed_dependency");
+    assert_eq!(
+        out.impact.findings[0].paths,
+        ["app.py", "helpers.py", "utils.py"]
+    );
+    let fixed = Repo::new(&[("app.py", "import utils\n"), ("utils.py", "")]);
+    assert!(compare(&before, &fixed, changes).impact.findings.is_empty());
+}
+
+#[test]
+fn deleted_rust_module_and_renamed_use() {
+    let before = Repo::new(&[
+        ("src/lib.rs", "mod helpers; mod app;"),
+        ("src/helpers.rs", "pub fn run() {}"),
+        ("src/app.rs", "use crate::helpers::run;"),
+    ]);
+    let after = Repo::new(&[
+        ("src/lib.rs", "mod utils; mod app;"),
+        ("src/utils.rs", "pub fn run() {}"),
+        ("src/app.rs", "use crate::helpers::run;"),
+    ]);
+    let out = compare(
+        &before,
+        &after,
+        serde_json::json!([{"path":"src/utils.rs","old_path":"src/helpers.rs","status":"renamed"}]),
+    );
+    assert!(out
+        .impact
+        .findings
+        .iter()
+        .any(|f| f.code == "renamed_dependency" && f.paths[0] == "src/app.rs"));
+    assert!(!out
+        .impact
+        .findings
+        .iter()
+        .any(|f| f.paths[0] == "src/lib.rs"));
+    let deleted = Repo::new(&[
+        ("src/lib.rs", "mod helpers; mod app;"),
+        ("src/app.rs", "use crate::helpers::run;"),
+    ]);
+    assert!(compare(
+        &before,
+        &deleted,
+        serde_json::json!([{"path":"src/helpers.rs","status":"deleted"}])
+    )
+    .impact
+    .findings
+    .iter()
+    .any(|f| f.code == "deleted_dependency"));
+}
+
+#[test]
+fn public_python_symbol_change_is_possible_not_runtime_failure() {
+    let before = Repo::new(&[
+        ("app.py", "from helpers import run\n"),
+        ("helpers.py", "def run(x):\n    return x\n"),
+    ]);
+    let after = Repo::new(&[
+        ("app.py", "from helpers import run\n"),
+        ("helpers.py", "def run(x, y):\n    return y\n"),
+    ]);
+    let out = compare(
+        &before,
+        &after,
+        serde_json::json!([{"path":"helpers.py","status":"modified"}]),
+    );
+    let finding = out
+        .impact
+        .findings
+        .iter()
+        .find(|f| f.code == "public_symbol_changed")
+        .unwrap();
+    assert_eq!(finding.confidence, "possible");
+    assert!(finding.evidence.contains("run(x, y)"));
+    let body_only = Repo::new(&[
+        ("app.py", "from helpers import run\n"),
+        ("helpers.py", "def run(x):\n    return x + 1\n"),
+    ]);
+    assert!(compare(
+        &before,
+        &body_only,
+        serde_json::json!([{"path":"helpers.py","status":"modified"}])
+    )
+    .impact
+    .findings
+    .is_empty());
+}
+
+#[test]
+fn rust_public_symbol_removed_or_signature_changed() {
+    let before = Repo::new(&[
+        ("src/lib.rs", "mod helpers; mod app;"),
+        ("src/helpers.rs", "pub fn run(x: u32) {}"),
+        ("src/app.rs", "use crate::helpers::run;"),
+    ]);
+    for source in [
+        "pub fn run(x: String) {}",
+        "fn run(x: u32) {}",
+        "pub fn other() {}",
+    ] {
+        let after = Repo::new(&[
+            ("src/lib.rs", "mod helpers; mod app;"),
+            ("src/helpers.rs", source),
+            ("src/app.rs", "use crate::helpers::run;"),
+        ]);
+        let out = compare(
+            &before,
+            &after,
+            serde_json::json!([{"path":"src/helpers.rs","status":"modified"}]),
+        );
+        assert!(out
+            .impact
+            .findings
+            .iter()
+            .any(|f| f.code == "public_symbol_changed" && f.evidence.contains("run")));
+    }
+}
+
+#[test]
+fn external_imports_and_unrelated_changes_are_not_findings() {
+    let before = Repo::new(&[("app.py", "import serde\nimport os\n"), ("other.py", "")]);
+    let after = Repo::new(&[
+        ("app.py", "import serde\nimport os\n"),
+        ("other.py", "x=1\n"),
+    ]);
+    assert!(compare(
+        &before,
+        &after,
+        serde_json::json!([{"path":"other.py","status":"modified"}])
+    )
+    .impact
+    .findings
+    .is_empty());
+    let legacy = after.run(&["other.py"]);
+    assert!(legacy.impact.findings.is_empty());
+    assert!(legacy
+        .impact
+        .limitations
+        .iter()
+        .any(|l| l.contains("No baseline")));
+}
+
+#[test]
+fn incomplete_snapshot_reports_possible_and_invalid_changes_fail() {
+    let before = Repo::new(&[
+        ("app.py", "import helpers\n"),
+        ("broken.py", "def ?"),
+        ("helpers.py", ""),
+    ]);
+    let after = Repo::new(&[("app.py", "import helpers\n")]);
+    let out = compare(
+        &before,
+        &after,
+        serde_json::json!([{"path":"helpers.py","status":"deleted"}]),
+    );
+    assert_eq!(out.impact.findings[0].confidence, "possible");
+    for changes in [
+        serde_json::json!([{"path":"x","status":"renamed"}]),
+        serde_json::json!([{"path":"../x","status":"added"}]),
+    ] {
+        let input = serde_json::from_value(
+            serde_json::json!({"protocol_version":1,"repo_path":after.0,"changes":changes}),
+        )
+        .unwrap();
+        assert!(analyze(input).is_err());
+    }
+}
+
 struct Repo(PathBuf);
 impl Repo {
     fn new(files: &[(&str, &str)]) -> Self {
@@ -26,6 +289,8 @@ impl Repo {
     fn input(&self, changed: &[&str]) -> Input {
         Input {
             protocol_version: 1,
+            baseline_repo_path: None,
+            changes: vec![],
             repo_path: self.0.to_str().unwrap().into(),
             changed_files: changed.iter().map(|p| (*p).into()).collect(),
         }
@@ -442,13 +707,14 @@ fn cli_outputs_exact_protocol_with_no_extra_stdout() {
             "affected_files",
             "changed_files",
             "edges",
+            "impact",
             "protocol_version",
             "warnings"
         ]
     );
     assert_eq!(
         response["affected_files"][0],
-        serde_json::json!({"path":"a.py","distance":1,"reason":"depends on changed file"})
+        serde_json::json!({"path":"a.py","distance":1,"reason":"depends on changed file","chain":["a.py","b.py"]})
     );
     assert_eq!(
         response["edges"][0],
@@ -467,7 +733,7 @@ fn cli_errors_preserve_response_shape_and_fail_exit_status() {
         let (success, response) = cli(input);
         assert!(!success);
         assert_eq!(response["protocol_version"], 1);
-        assert_eq!(response.as_object().unwrap().len(), 5);
+        assert_eq!(response.as_object().unwrap().len(), 6);
         assert!(!response["warnings"].as_array().unwrap().is_empty());
     }
 }

@@ -1,4 +1,5 @@
 use crate::{join, local_join, parent, relative, Files, Graph};
+use quote::ToTokens;
 use std::collections::{BTreeMap, BTreeSet};
 use syn::visit::Visit;
 use syn::{Attribute, Expr, ItemMod, ItemUse, Lit, Meta, UseTree};
@@ -9,6 +10,7 @@ struct Import {
     module: Vec<String>,
     path: Vec<String>,
     absolute: bool,
+    evidence: String,
 }
 
 struct Unit {
@@ -144,6 +146,17 @@ impl<'ast> Visit<'ast> for Collector<'_> {
     }
 
     fn visit_item_mod(&mut self, item: &'ast ItemMod) {
+        let evidence = format!(
+            "Rust module {}: mod {} {}",
+            self.module.join("::"),
+            item.ident,
+            item.attrs
+                .iter()
+                .map(|a| a.to_token_stream().to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        self.graph.import(&self.file, &evidence);
         self.attributes(&item.attrs);
         let name = ident(&item.ident);
         let mut module = self.module.clone();
@@ -198,7 +211,8 @@ impl<'ast> Visit<'ast> for Collector<'_> {
                 .collect();
             if found.len() == 1 {
                 self.file = found[0].clone();
-                self.graph.edge(&previous_file, &self.file);
+                self.graph
+                    .reference(&previous_file, &self.file, None, &evidence);
                 self.unit.modules.insert(module.clone(), self.file.clone());
                 self.module = module;
                 self.explicit_dir = parent(&self.file).into();
@@ -237,10 +251,22 @@ impl<'ast> Visit<'ast> for Collector<'_> {
         let mut paths = Vec::new();
         use_paths(&item.tree, vec![], &mut paths);
         for path in paths {
+            let evidence = format!(
+                "Rust module {}: use {}{}",
+                self.module.join("::"),
+                if item.leading_colon.is_some() {
+                    "::"
+                } else {
+                    ""
+                },
+                path.join("::")
+            );
+            self.graph.import(&self.file, &evidence);
             if path.last().is_some_and(|p| p == "*") {
                 self.graph.warn(&self.file, "Rust wildcard import: module dependency recorded, re-export targets are unknown");
             }
             self.unit.imports.push(Import {
+                evidence,
                 file: self.file.clone(),
                 module: self.module.clone(),
                 path,
@@ -496,7 +522,16 @@ pub(super) fn analyze(files: &Files, graph: &mut Graph) {
                 }
             }
             if candidates.len() == 1 {
-                graph.edge(&import.file, candidates.iter().next().unwrap());
+                graph.reference(
+                    &import.file,
+                    candidates.iter().next().unwrap(),
+                    import
+                        .path
+                        .last()
+                        .filter(|p| !["*", "self"].contains(&p.as_str()))
+                        .cloned(),
+                    &import.evidence,
+                );
             } else {
                 graph.warn(&import.file, format!("Cannot reliably resolve use {} in crate {} (external dependency, alias, re-export, or ambiguous module)", import.path.join("::"), unit.root));
             }
