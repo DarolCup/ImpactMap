@@ -117,15 +117,13 @@ impl Analyzer<'_> {
         );
         self.graph.import(self.file, &self.evidence);
         let (root, base) = if level > 0 {
-            let root = if self.roots.contains(&"src") && self.file.starts_with("src/") {
-                "src"
-            } else {
-                ""
-            };
+            let root = self.roots.iter().copied()
+                .filter(|root| !root.is_empty() && self.file.starts_with(&format!("{root}/")))
+                .max_by_key(|root| root.len()).unwrap_or("");
             let local = if root.is_empty() {
                 self.file
             } else {
-                self.file.strip_prefix("src/").unwrap()
+                &self.file[root.len() + 1..]
             };
             let directory = parent(local);
             let mut parts: Vec<_> = if directory.is_empty() {
@@ -227,7 +225,24 @@ pub(super) fn analyze(files: &Files, graph: &mut Graph) {
     let has_src = files
         .keys()
         .any(|p| p.starts_with("src/") && p.ends_with(".py"));
-    let roots = if has_src { vec!["", "src"] } else { vec![""] };
+    let mut root_names: Vec<String> = if has_src { vec!["".into(), "src".into()] } else { vec!["".into()] };
+    if let Some(config) = files.get(".impactmap.json") {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Config { python_source_roots: Vec<String> }
+        let configured = serde_json::from_str::<Config>(config)
+            .map_err(|e| e.to_string())
+            .and_then(|config| config.python_source_roots.iter().map(|p| {
+                if p == "." { Ok(String::new()) } else { crate::relative(p) }
+            }).collect::<Result<Vec<_>, _>>());
+        match configured {
+            Ok(extra) => root_names.extend(extra),
+            Err(e) => graph.warn(".impactmap.json", format!("Invalid Python source roots; using defaults: {e}")),
+        }
+    }
+    root_names.sort();
+    root_names.dedup();
+    let roots: Vec<&str> = root_names.iter().map(String::as_str).collect();
     if has_src {
         graph.warn("src", "Python absolute imports use repository root and src/ as candidate source roots; runtime sys.path is not evaluated");
     }

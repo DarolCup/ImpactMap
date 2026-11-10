@@ -7,6 +7,42 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
+#[test]
+fn planning_inventory_includes_isolated_sources_and_excludes_historical_edges() {
+    let before = Repo::new(&[("app.py", "import helpers\n"), ("helpers.py", "")]);
+    let after = Repo::new(&[("app.py", "import helpers\n"), ("isolated.py", ""), ("README.md", "hello")]);
+    let out = compare(&before, &after, serde_json::json!([{"path":"helpers.py","status":"deleted"}]));
+    assert_eq!(out.files, ["app.py", "isolated.py"]);
+    assert!(out.current_edges.is_empty());
+    assert_eq!(out.edges.len(), 1);
+    assert_eq!(out.analyzer_version, "0.0.3");
+}
+
+#[test]
+fn configured_python_roots_support_scripts_and_relative_packages() {
+    let repo = Repo::new(&[
+        (".impactmap.json", r#"{"python_source_roots":["desktop-py"]}"#),
+        ("desktop-py/main.py", "from helpers import greet\nimport pkg.child\n"),
+        ("desktop-py/helpers.py", "def greet(): pass\n"),
+        ("desktop-py/pkg/__init__.py", ""),
+        ("desktop-py/pkg/child.py", "from . import sibling\n"),
+        ("desktop-py/pkg/sibling.py", ""),
+    ]);
+    assert_eq!(repo.run(&["desktop-py/helpers.py"]).affected_files[0].path, "desktop-py/main.py");
+    let out = repo.run(&["desktop-py/pkg/sibling.py"]);
+    assert!(out.current_edges.iter().any(|e| e.from == "desktop-py/pkg/child.py" && e.to == "desktop-py/pkg/sibling.py"));
+}
+
+#[test]
+fn invalid_python_root_config_warns_without_following_outside_paths() {
+    for config in [r#"{"python_source_roots":["../outside"]}"#, r#"{"python_source_roots":"bad"}"#] {
+        let repo = Repo::new(&[(".impactmap.json", config), ("a.py", "import b\n"), ("b.py", "")]);
+        let out = repo.run(&["b.py"]);
+        assert_eq!(out.affected_files[0].path, "a.py");
+        assert!(out.warnings.iter().any(|w| w.contains("Invalid Python source roots")));
+    }
+}
+
 fn compare(before: &Repo, after: &Repo, changes: serde_json::Value) -> Output {
     analyze(
         serde_json::from_value(serde_json::json!({
@@ -705,8 +741,11 @@ fn cli_outputs_exact_protocol_with_no_extra_stdout() {
         keys,
         [
             "affected_files",
+            "analyzer_version",
             "changed_files",
+            "current_edges",
             "edges",
+            "files",
             "impact",
             "protocol_version",
             "warnings"
@@ -733,7 +772,7 @@ fn cli_errors_preserve_response_shape_and_fail_exit_status() {
         let (success, response) = cli(input);
         assert!(!success);
         assert_eq!(response["protocol_version"], 1);
-        assert_eq!(response.as_object().unwrap().len(), 6);
+        assert_eq!(response.as_object().unwrap().len(), 9);
         assert!(!response["warnings"].as_array().unwrap().is_empty());
     }
 }

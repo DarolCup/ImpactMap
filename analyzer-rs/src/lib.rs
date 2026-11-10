@@ -23,6 +23,13 @@ pub struct Input {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Output {
     pub protocol_version: u32,
+    pub analyzer_version: String,
+    /// Readable source files, including isolated files without dependency edges.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// Current snapshot only: excludes historical edges restored by comparison.
+    #[serde(default)]
+    pub current_edges: Vec<Edge>,
     pub changed_files: Vec<String>,
     pub affected_files: Vec<AffectedFile>,
     pub edges: Vec<Edge>,
@@ -51,6 +58,9 @@ impl Output {
     pub fn failure(message: String) -> Self {
         Self {
             protocol_version: 1,
+            analyzer_version: env!("CARGO_PKG_VERSION").into(),
+            files: vec![],
+            current_edges: vec![],
             changed_files: vec![],
             affected_files: vec![],
             edges: vec![],
@@ -212,6 +222,7 @@ fn scan(root: &Path, dir: &Path, files: &mut Files, graph: &mut Graph) {
             }
         } else if path.extension().is_some_and(|e| e == "rs" || e == "py")
             || entry.file_name() == "Cargo.toml"
+            || rel == ".impactmap.json"
         {
             match fs::read_to_string(&path) {
                 Ok(text) => {
@@ -276,6 +287,7 @@ pub fn analyze(input: Input) -> Result<Output, String> {
     scan(&root, &root, &mut files, &mut graph);
     rust::analyze(&files, &mut graph);
     python::analyze(&files, &mut graph);
+    let current_edges = graph.edges.iter().cloned().collect();
     let mut impact = Impact::default();
     if let Some(baseline) = input.baseline_repo_path {
         if !Path::new(&baseline).is_absolute() {
@@ -380,6 +392,9 @@ pub fn analyze(input: Input) -> Result<Output, String> {
         .collect();
     Ok(Output {
         protocol_version: 1,
+        analyzer_version: env!("CARGO_PKG_VERSION").into(),
+        files: files.keys().filter(|p| p.ends_with(".rs") || p.ends_with(".py")).cloned().collect(),
+        current_edges,
         changed_files: changed.into_iter().collect(),
         affected_files,
         edges: graph.edges.into_iter().collect(),
