@@ -1,21 +1,25 @@
 {
   "protocol_version": 1,
-  "changed_files": ["src/main.rs"],
+  "changed_files": ["helpers.py"],
   "affected_files": [
-    {
-      "path": "src/lib.rs",
-      "distance": 1,
-      "reason": "depends on changed file"
-    },
-    {
-      "path": "tests/integration.rs",
-      "distance": 2,
-      "reason": "depends on src/lib.rs"
-    }
+    {"path": "app.py", "distance": 1, "reason": "depends on changed file", "chain": ["app.py", "helpers.py"]},
+    {"path": "runner.py", "distance": 2, "reason": "depends on changed file", "chain": ["runner.py", "app.py", "helpers.py"]}
   ],
   "edges": [
-    {"from": "src/lib.rs", "to": "src/main.rs", "relation": "imports"},
-    {"from": "tests/integration.rs", "to": "src/lib.rs", "relation": "imports"}
+    {"from": "app.py", "to": "helpers.py", "relation": "imports"},
+    {"from": "runner.py", "to": "app.py", "relation": "imports"}
   ],
-  "warnings": []
+  "warnings": [],
+  "impact": {
+    "findings": [
+      {
+        "code": "public_symbol_changed",
+        "severity": "warning",
+        "confidence": "possible",
+        "paths": ["app.py", "helpers.py"],
+        "evidence": "app.py импортирует greet. До правки — greet(name). После правки — greet(name, punctuation)."
+      }
+    ],
+    "limitations": []
+  }
 }
