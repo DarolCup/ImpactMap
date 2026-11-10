@@ -1,9 +1,45 @@
 from collections import defaultdict, deque
 
-from analysis import AnalysisResult
+from analysis import AnalysisError, AnalysisResult, Change
 
 
-STATUS = {"added": "Добавлен", "modified": "Изменён", "deleted": "Удалён", "renamed": "Переименован"}
+STATUS = {"added": "Добавлен", "modified": "Изменён", "deleted": "Удалён", "renamed": "Переименован",
+          "planned": "Планируется"}
+
+
+def preview_impact(result: AnalysisResult, path: str) -> AnalysisResult:
+    """Predict file reachability on the loaded current snapshot, without editing it."""
+    data = result.response
+    if "current_edges" not in data or path not in data.get("files", []):
+        raise AnalysisError("Для прогноза нужен анализатор 0.0.3 и файл из текущего снимка.")
+    incoming = defaultdict(set)
+    outgoing = defaultdict(set)
+    for edge in data["current_edges"]:
+        incoming[edge["to"]].add(edge["from"])
+        outgoing[edge["from"]].add(edge["to"])
+    distances = {path: 0}
+    queue = deque([path])
+    while queue:
+        target = queue.popleft()
+        for source in incoming[target]:
+            if source not in distances:
+                distances[source] = distances[target] + 1
+                queue.append(source)
+    chains = {path: [path]}
+    for distance, source in sorted((d, p) for p, d in distances.items() if d):
+        tail = min(chains[target] for target in outgoing[source] if distances.get(target) == distance - 1)
+        chains[source] = [source, *tail]
+    affected = [dict(path=source, distance=distances[source], reason="depends on selected file", chain=chains[source])
+                for source in sorted(distances) if source != path and source in data["files"]]
+    response = {**data, "changed_files": [path], "affected_files": affected, "edges": data["current_edges"],
+                "impact": {"findings": [], "limitations": [
+                    "Прогноз по импортам текущего снимка. Он не доказывает поломку и не оценивает ещё не написанный код.",
+                    "Отсутствие связей не гарантирует отсутствие влияния: динамические зависимости и другие языки не покрыты.",
+                ]}}
+    return AnalysisResult(result.source, f"Прогноз до изменения · {path} · снимок: {result.comparison}",
+                          [Change(path, "planned")], response,
+                          (*result.notes, "Файлы не изменялись. Прогноз использует загруженный снимок; для обновления нажмите «Проверить изменения»."),
+                          planned=True)
 
 
 def display_path(path: str) -> str:
@@ -53,6 +89,7 @@ class ResultModel:
         self.findings = sorted(impact.get("findings", []), key=lambda item: item["severity"] != "high")
         self.edges = {(edge["from"], edge["to"]) for edge in response["edges"]}
         self.paths = self.changed | self.affected.keys() | {path for pair in self.edges for path in pair}
+        self.paths.update(response.get("files", []))
         self.incoming = defaultdict(set)
         self.outgoing = defaultdict(set)
         for source, target in self.edges:

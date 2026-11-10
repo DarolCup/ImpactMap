@@ -14,7 +14,8 @@ from analysis import AnalysisError
 from github_repo import REPOSITORY, analyze_github, parse_repository
 from graph import DependencyGraph
 from local_repo import analyze_example, analyze_local
-from result import ResultModel, chain_text, display_path, finding_text, limitation_text
+from result import ResultModel, chain_text, display_path, finding_text, limitation_text, preview_impact
+from report import render_report
 from theme import colors_for, stylesheet
 
 
@@ -70,10 +71,11 @@ class MainWindow(QMainWindow):
         self.selected_path = None
         self.last_github = None
         self.active_source = None
+        self.loaded_result = None
         self.cache = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.CacheLocation))
         self.colors = colors_for(QApplication.instance())
         self.setStyleSheet(stylesheet(self.colors))
-        self.setWindowTitle("ImpactMap")
+        self.setWindowTitle("ImpactMap 0.0.3")
         self.resize(1100, 740)
         self.setMinimumSize(575, 465)
 
@@ -83,6 +85,18 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(20, 16, 20, 16)
         layout.setSpacing(12)
         layout.addWidget(self.build_source())
+        planning = QHBoxLayout()
+        planning.addWidget(plain_label("До изменения файла:"))
+        self.plan_file = QComboBox()
+        self.plan_file.setAccessibleName("Файл для предварительной оценки влияния")
+        self.plan_file.setMinimumContentsLength(12)
+        self.plan_file.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.plan_file.currentIndexChanged.connect(self.preview_file)
+        planning.addWidget(self.plan_file, 1)
+        self.export = QPushButton("Сохранить HTML…")
+        self.export.clicked.connect(self.export_report)
+        planning.addWidget(self.export)
+        layout.addLayout(planning)
 
         self.summary = plain_label(name="muted")
         self.summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -161,6 +175,7 @@ class MainWindow(QMainWindow):
         tools.addWidget(self.full)
         tools.addWidget(self.picker, 1)
         self.graph = DependencyGraph(self.colors)
+        self.graph.setMinimumHeight(100)
         for text, label, action in (
             ("−", "Уменьшить масштаб", lambda: self.graph.zoom(1 / 1.25)),
             ("+", "Увеличить масштаб", lambda: self.graph.zoom(1.25)),
@@ -177,7 +192,7 @@ class MainWindow(QMainWindow):
 
         c = self.colors
         legend = QLabel(
-            f'<span style="color:{c["changed"]}">● Изменённые</span> &nbsp; '
+            f'<span style="color:{c["changed"]}">● Изменённые / планируемые</span> &nbsp; '
             f'<span style="color:{c["affected"]}">● Затронутые</span> &nbsp; '
             f'<span style="color:{c["accent"]}">◆ Выбранный</span> &nbsp; · &nbsp; A → B: A использует B'
         )
@@ -251,7 +266,8 @@ class MainWindow(QMainWindow):
         prompt = ("Выберите папку проекта с Git. Сравним рабочую папку с последним коммитом (HEAD)."
                   if local else "Введите имя публичного репозитория или ссылку на него. Сравним последний коммит ветки по умолчанию с его первым родителем.")
         self.write(self.overview, self.heading("Проверьте свой проект", 1) + f"<p>{prompt}</p>"
-                   "<p>Нажмите «Проверить изменения». Начать можно и с готового примера из трёх файлов Python.</p>")
+                   "<p>Нажмите «Проверить изменения», затем выберите файл в списке «До изменения файла», "
+                   "чтобы увидеть возможное влияние без редактирования. Начать можно с готового примера.</p>")
 
     def choose_folder(self):
         path = QFileDialog.getExistingDirectory(self, "Выберите папку Git-репозитория", self.folder.text())
@@ -274,6 +290,12 @@ class MainWindow(QMainWindow):
 
     def clear_result(self):
         self.model = None
+        self.loaded_result = None
+        with QSignalBlocker(self.plan_file):
+            self.plan_file.clear()
+            self.plan_file.addItem("Сначала загрузите проект")
+        self.plan_file.setEnabled(False)
+        self.export.setEnabled(False)
         self.selected_path = None
         self.tabs.setCurrentIndex(0)
         self.tabs.setTabEnabled(1, False)
@@ -316,9 +338,20 @@ class MainWindow(QMainWindow):
         else:
             self.show_error(message)
 
-    def show_result(self, result):
+    def show_result(self, result, *, remember=True):
         self.model = model = ResultModel(result)
-        if isinstance(self.active_source, str):
+        if remember:
+            self.loaded_result = result
+            available = "current_edges" in result.response and "files" in result.response
+            with QSignalBlocker(self.plan_file):
+                self.plan_file.clear()
+                self.plan_file.addItem("Показать проверенные изменения" if available else "Для прогноза соберите анализатор 0.0.3")
+                if available:
+                    for path in result.response["files"]:
+                        self.plan_file.addItem(display_path(path), path)
+            self.plan_file.setEnabled(available)
+        self.export.setEnabled(True)
+        if remember and isinstance(self.active_source, str):
             self.last_github = (self.active_source, result)
         self.summary.setText(f"{result.source}   ·   {result.comparison}")
         self.tabs.setTabEnabled(1, True)
@@ -331,17 +364,38 @@ class MainWindow(QMainWindow):
         self.render_overview()
         self.tabs.setCurrentIndex(0)
 
+    def preview_file(self, _index):
+        if self.loaded_result is None:
+            return
+        path = self.plan_file.currentData()
+        result = preview_impact(self.loaded_result, path) if path else self.loaded_result
+        self.show_result(result, remember=False)
+        if path:
+            self.tabs.setCurrentIndex(1)
+            self.select_path(path, center=True)
+
+    def export_report(self):
+        if self.model is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить отчёт", "impactmap-report.html", "HTML (*.html)")
+        if path:
+            try:
+                Path(path).write_text(render_report(self.model.result), encoding="utf-8")
+                self.statusBar().showMessage(f"Отчёт сохранён: {path}", 8000)
+            except OSError as exc:
+                self.statusBar().showMessage(f"Не удалось сохранить отчёт: {exc}", 10000)
+
     def render_overview(self, refresh_error=None):
         model = self.model
         result = model.result
         c = self.colors
-        counts = [("Изменено файлов", len(model.changes)), ("Связано с правками", len(model.affected)),
+        counts = [("Выбрано для прогноза" if result.planned else "Изменено файлов", len(model.changes)), ("Потенциально затронуто", len(model.affected)),
                   ("Требуют внимания", len(model.findings))]
         cells = "".join(
             f'<td bgcolor="{c["canvas"]}" width="33%"><span style="color:{c["accent"]};font-size:21pt">'
             f'<b>{count}</b></span><br>{label}</td>' for label, count in counts
         )
-        content = [self.heading("Результат проверки", 1),
+        content = [self.heading("Прогноз до изменения" if result.planned else "Результат проверки", 1),
                    f'<table width="100%" cellspacing="6" cellpadding="8"><tr>{cells}</tr></table><p></p>']
         if refresh_error:
             content.insert(0, self.heading("GitHub недоступен. Показана предыдущая проверка.")
@@ -349,7 +403,8 @@ class MainWindow(QMainWindow):
         content.extend(f"<p>{escape(note)}</p>" for note in result.notes)
         content.append(self.heading("Что проверить"))
         if not model.findings:
-            content.append("<p>Анализатор не сообщил о конкретных проблемах.</p>")
+            content.append("<p>Прогноз показывает зависимые файлы. Конкретные поломки до изменения кода не определяются.</p>"
+                           if result.planned else "<p>Анализатор не сообщил о конкретных проблемах.</p>")
         for item in model.findings:
             title, detail, action = finding_text(item)
             confidence = "Подтверждённая связь" if item["confidence"] == "confirmed" else "Возможная проблема"
@@ -366,7 +421,7 @@ class MainWindow(QMainWindow):
                 kind = "Прямая связь" if model.affected[path]["distance"] == 1 else "Косвенная связь"
                 content.append(f"<p>{kind} · {self.link(text, f'chain:{index}')}</p>")
         else:
-            content.append(self.heading("Связанных файлов не найдено"))
+            content.append(self.heading("Связанных файлов не найдено") + "<p>Это не гарантирует отсутствие влияния: часть зависимостей может быть не распознана.</p>")
         if model.limitations or model.warnings or "impact" not in result.response:
             content.append(self.heading("Ограничения проверки"))
             if "impact" not in result.response:
@@ -376,7 +431,8 @@ class MainWindow(QMainWindow):
                 content.append("<p>Часть импортов или исходников могла остаться вне проверки.</p>")
             warnings = {message for messages in model.warnings.values() for message in messages}
             limitations = (note for note in model.limitations if note not in warnings)
-            content.extend(f"<p>{escape(note)}</p>" for note in dict.fromkeys(map(limitation_text, limitations)))
+            content.extend(f"<p>{escape(note)}</p>" for note in dict.fromkeys(
+                limitations if result.planned else map(limitation_text, limitations)))
         content.append(f'<p>{self.link("Файлы и подробности →", "files:open")}</p>')
         self.write(self.overview, "".join(content))
 
@@ -522,6 +578,10 @@ class MainWindow(QMainWindow):
     def set_controls_enabled(self, enabled):
         for control in (self.mode, self.repository, self.folder, self.choose, self.check, self.demo):
             control.setEnabled(enabled)
+        self.plan_file.setEnabled(enabled and self.loaded_result is not None
+                                  and "current_edges" in self.loaded_result.response
+                                  and "files" in self.loaded_result.response)
+        self.export.setEnabled(enabled and self.model is not None)
 
     def closeEvent(self, event):
         if self.worker is not None:

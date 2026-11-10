@@ -14,7 +14,8 @@ from analysis import AnalysisError, AnalysisResult, Change, git, isolated_git_en
 from github_repo import analyze_github
 from local_repo import analyze_example, analyze_local
 from main import MainWindow
-from result import ResultModel, finding_text
+from result import ResultModel, finding_text, preview_impact
+from report import render_report
 
 
 REAL = os.environ.get("IMPACTMAP_TEST_ANALYZER")
@@ -33,6 +34,55 @@ def affected(path, distance, **extra):
 
 
 class AnalysisTests(unittest.TestCase):
+    def test_preview_cycles_ties_isolated_files_and_historical_edges(self):
+        edges = [("runner.py", "app.py"), ("runner.py", "alt.py"), ("app.py", "helpers.py"),
+                 ("alt.py", "helpers.py"), ("helpers.py", "runner.py")]
+        data = response(["deleted.py"], edges=[*edges, ("isolated.py", "deleted.py")],
+                        files=["alt.py", "app.py", "helpers.py", "isolated.py", "runner.py"],
+                        current_edges=response(edges=edges)["edges"],
+                        impact={"findings": [], "limitations": []})
+        original = AnalysisResult("Test", "clean HEAD", [Change("deleted.py", "deleted")], data)
+        saved = json.dumps(data, sort_keys=True)
+        planned = preview_impact(original, "helpers.py")
+        model = ResultModel(planned)
+        self.assertEqual(model.chains["runner.py"], ("runner.py", "alt.py", "helpers.py"))
+        self.assertEqual(set(model.affected), {"alt.py", "app.py", "runner.py"})
+        self.assertEqual(model.role("helpers.py"), "Планируется")
+        self.assertNotIn(("isolated.py", "deleted.py"), model.edges)
+        self.assertFalse(preview_impact(original, "isolated.py").response["affected_files"])
+        self.assertEqual(json.dumps(data, sort_keys=True), saved)
+        with self.assertRaises(AnalysisError):
+            preview_impact(original, "deleted.py")
+
+    def test_report_escapes_repository_content_and_response_rejects_bad_planning_data(self):
+        html = render_report(AnalysisResult("<script>alert(1)</script>", "HEAD", [], response(warnings=["<img src=x>"])))
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+        self.assertIn("&lt;img src=x&gt;", html)
+        for extra in ({"files": [None]}, {"current_edges": [{"from": "a.py"}]}):
+            with self.assertRaises(AnalysisError):
+                parse_response(json.dumps(response(**extra)).encode())
+
+    @unittest.skipUnless(REAL, "set IMPACTMAP_TEST_ANALYZER")
+    def test_preview_clean_repository_matches_rust_without_touching_files(self):
+        from analysis import analyze
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            env = isolated_git_env()
+            git(root, "init", "--template=", env=env)
+            for name, content in {"runner.py": "import app\n", "app.py": "import helpers\n", "helpers.py": "", "alone.py": ""}.items():
+                (root / name).write_text(content, encoding="utf-8")
+            git(root, "add", "--all", env=env)
+            git(root, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "First", env=env)
+            original = analyze_local(root, REAL)
+            self.assertFalse(original.changes)
+            planned = preview_impact(original, "helpers.py")
+            rust = analyze(root, root, [Change("helpers.py", "modified")], REAL)
+            self.assertEqual([(a["path"], a["distance"], a["chain"]) for a in planned.response["affected_files"]],
+                             [(a["path"], a["distance"], a["chain"]) for a in rust["affected_files"]])
+            self.assertEqual(git(root, "status", "--porcelain", env=env), b"")
+            self.assertIn("alone.py", ResultModel(original).paths)
+
     def test_old_response_recovers_chain_and_groups_full_warning(self):
         parsed = parse_response(json.dumps(response(
             ["helpers.py"], [affected("app.py", 1), affected("runner.py", 2)],
@@ -157,6 +207,25 @@ class WindowTests(unittest.TestCase):
         while self.window.worker is not None and monotonic() < deadline:
             QTest.qWait(25)
         self.assertIsNone(self.window.worker)
+
+    @unittest.skipUnless(REAL, "set IMPACTMAP_TEST_ANALYZER")
+    def test_preview_and_restore_demo_then_export(self):
+        self.window.demo.click()
+        self.wait_for_worker()
+        original = self.window.loaded_result
+        self.window.plan_file.setCurrentIndex(self.window.plan_file.findData("helpers.py"))
+        self.assertTrue(self.window.model.result.planned)
+        self.assertEqual(self.window.tabs.currentIndex(), 1)
+        self.assertEqual(set(self.window.graph.nodes), {"helpers.py", "app.py", "runner.py"})
+        self.assertFalse(self.window.model.findings)
+        with TemporaryDirectory() as temp:
+            output = Path(temp) / "report.html"
+            with patch("main.QFileDialog.getSaveFileName", return_value=(str(output), "HTML (*.html)")):
+                self.window.export.click()
+            self.assertIn("Прогноз до изменения", output.read_text(encoding="utf-8"))
+        self.window.plan_file.setCurrentIndex(0)
+        self.assertIs(self.window.model.result, original)
+        self.assertFalse(self.window.model.result.planned)
 
     def test_demo_loading_and_empty_result(self):
         self.window.analyzer = "/nonexistent/impactmap-analyzer"

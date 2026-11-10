@@ -62,6 +62,7 @@ class AnalysisResult:
     changes: list[Change]
     response: dict
     notes: tuple[str, ...] = ()
+    planned: bool = False
 
 
 def parse_changes(output: bytes, snapshot_paths: bool = False) -> list[Change]:
@@ -147,6 +148,16 @@ def parse_response(data: bytes) -> dict:
     for item in response["affected_files"]:
         if not strings(item.get("chain")):
             item.pop("chain", None)
+
+    if "files" in response and not strings(response["files"]):
+        raise AnalysisError("Некорректный список исходных файлов анализатора.")
+    if "current_edges" in response:
+        edges = response["current_edges"]
+        if not isinstance(edges, list) or not all(
+            isinstance(edge, dict) and all(isinstance(edge.get(key), str) for key in ("from", "to", "relation"))
+            for edge in edges
+        ):
+            raise AnalysisError("Некорректный граф текущего снимка анализатора.")
 
     impact = response.get("impact")
     if isinstance(impact, dict):
