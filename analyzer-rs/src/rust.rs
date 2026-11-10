@@ -111,7 +111,7 @@ impl Collector<'_> {
             .iter()
             .any(|a| a.path().is_ident("cfg") || a.path().is_ident("cfg_attr"))
         {
-            self.graph.warn(&self.file, "Conditional Rust dependencies are analyzed conservatively; cfg/build features are not evaluated");
+            self.graph.limit(&self.file, "Conditional Rust dependencies are analyzed conservatively; cfg/build features are not evaluated");
         }
     }
 }
@@ -246,7 +246,7 @@ impl<'ast> Visit<'ast> for Collector<'_> {
             self.unit.symbols.entry(self.module.clone()).or_default(),
         );
         if !matches!(item.vis, syn::Visibility::Inherited) {
-            self.graph.warn(&self.file, "Rust re-export recorded at its source; downstream symbol/re-export chains are not expanded");
+            self.graph.limit(&self.file, "Rust re-export recorded at its source; downstream symbol/re-export chains are not expanded");
         }
         let mut paths = Vec::new();
         use_paths(&item.tree, vec![], &mut paths);
@@ -276,7 +276,7 @@ impl<'ast> Visit<'ast> for Collector<'_> {
     }
 
     fn visit_macro(&mut self, item: &'ast syn::Macro) {
-        self.graph.warn(&self.file, "Rust macro contents/expansion are not analyzed; generated imports and include! dependencies are unknown");
+        self.graph.limit(&self.file, "Rust macro contents/expansion are not analyzed; generated imports and include! dependencies are unknown");
         syn::visit::visit_macro(self, item);
     }
 
@@ -420,6 +420,49 @@ fn target(unit: &Unit, path: &[String]) -> Option<String> {
     None
 }
 
+fn external_crates(files: &Files, root: &str) -> BTreeSet<String> {
+    let mut names: BTreeSet<String> = ["std", "core", "alloc", "proc_macro"]
+        .map(String::from)
+        .into();
+    let manifest = files
+        .iter()
+        .filter(|(p, _)| {
+            p.rsplit('/').next() == Some("Cargo.toml")
+                && (parent(p).is_empty() || root.starts_with(&format!("{}/", parent(p))))
+        })
+        .max_by_key(|(p, _)| parent(p).len());
+    fn dependencies(value: &toml::Value, names: &mut BTreeSet<String>) {
+        if let Some(table) = value.as_table() {
+            for (key, value) in table {
+                if ["dependencies", "dev-dependencies", "build-dependencies"]
+                    .contains(&key.as_str())
+                {
+                    if let Some(deps) = value.as_table() {
+                        for (name, spec) in deps {
+                            // Path dependencies are local and must retain unresolved diagnostics.
+                            if spec.get("path").is_none() {
+                                names.insert(name.replace('-', "_"));
+                            }
+                        }
+                    }
+                } else if key == "target" {
+                    if let Some(targets) = value.as_table() {
+                        for value in targets.values() {
+                            dependencies(value, names);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some((_, text)) = manifest {
+        if let Ok(value) = toml::from_str::<toml::Value>(text) {
+            dependencies(&value, &mut names);
+        }
+    }
+    names
+}
+
 pub(super) fn analyze(files: &Files, graph: &mut Graph) {
     let mut units = Vec::new();
     for (root, library_name) in roots(files, graph) {
@@ -454,6 +497,7 @@ pub(super) fn analyze(files: &Files, graph: &mut Graph) {
         graph.warn(path, "Rust source is not reachable from a known crate root; crate context and imports are unknown");
     }
     for unit in &units {
+        let external = external_crates(files, &unit.root);
         for import in &unit.imports {
             let mut path = import.path.clone();
             if path.last().is_some_and(|p| p == "*" || p == "self") {
@@ -487,6 +531,18 @@ pub(super) fn analyze(files: &Files, graph: &mut Graph) {
                         candidates.insert(file);
                     }
                 }
+            } else if !explicit
+                && external.contains(&first)
+                && !unit.modules.keys().any(|p| p.first() == Some(&first))
+                && !unit
+                    .modules
+                    .contains_key(&[import.module.clone(), vec![first.clone()]].concat())
+                && !units
+                    .iter()
+                    .any(|u| u.library_name.as_deref() == Some(&first))
+            {
+                // Known external imports are outside this local dependency graph.
+                continue;
             } else {
                 // Local library crate names (including other workspace members), if unique.
                 let libs: Vec<_> = units
@@ -494,7 +550,7 @@ pub(super) fn analyze(files: &Files, graph: &mut Graph) {
                     .filter(|u| u.library_name.as_deref() == Some(&first))
                     .collect();
                 if libs.len() == 1 {
-                    graph.warn(&import.file, format!("Local crate {first} matched by manifest name; Cargo dependency aliases and workspace dependency inheritance are not evaluated"));
+                    graph.limit(&import.file, format!("Local crate {first} matched by manifest name; Cargo dependency aliases and workspace dependency inheritance are not evaluated"));
                     if let Some(file) = target(libs[0], &path[1..]) {
                         candidates.insert(file);
                     }

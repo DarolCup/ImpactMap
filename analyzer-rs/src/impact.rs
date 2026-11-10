@@ -164,6 +164,8 @@ pub(super) fn compare(
                 .warnings
                 .iter()
                 .chain(previous.warnings.iter())
+                .chain(current.limitations.iter())
+                .chain(previous.limitations.iter())
                 .any(|w| {
                     ![
                         "Cannot resolve Python import",
